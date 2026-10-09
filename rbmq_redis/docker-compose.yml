@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: docker.m.daocloud.io/rabbitmq:3.11-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"  # RabbitMQ 默认端口
+      - "15672:15672"  # RabbitMQ 管理界面端口
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: always
+
+  redis:
+    image: docker.m.daocloud.io/redis:7.0
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --requirepass password  # 启用密码验证
+    restart: always
+
+
+volumes:
+  rabbitmq_data:
+  redis_data:
+

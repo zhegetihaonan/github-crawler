@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  surface-task-dispatcher:
+    build:
+      context: ./src
+      dockerfile: ./app/Dockerfile
+    container_name: surface-task-dispatcher
+#    ports:
+#      - "8008:8000"
+    env_file:
+      - ./.env
+    volumes:
+      - ./src/app/logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
+    restart: always
+    network_mode: host
+
+  surface-crawler:
+    build:
+        context: ./src
+        dockerfile: ./crawler/Dockerfile
+    container_name: surface-crawler
+    env_file:
+      - ./.env
+    volumes:
+      - ./src/crawler/logs:/home/surface_crawler/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
+    restart: always
+    depends_on:
+      - surface-task-dispatcher
+    network_mode: host

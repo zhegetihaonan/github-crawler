@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  surface-task-dispatcher:
+#    build:
+#      context: ./src
+#      dockerfile: ./app/Dockerfile
+#    container_name: surface-task-dispatcher
+#    ports:
+#      - "8008:8000"
+    image: surface_web-surface-task-dispatcher:latest
+    container_name: surface-task-dispatcher
+    env_file:
+      - ./.env
+    volumes:
+      - ./src/app/logs:/app/logs
+    command: uvicorn main:app --host 0.0.0.0 --port 8008
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
+    restart: always
+    network_mode: host
+
+  surface-crawler:
+#    build:
+#        context: ./src
+#        dockerfile: ./crawler/Dockerfile
+    image: surface_web-surface-crawler:latest
+    container_name: surface-crawler
+    env_file:
+      - ./.env
+    volumes:
+      - ./src/crawler/logs:/home/surface_crawler/logs
+#      - ./src/crawler/crawler_github.py:/home/surface_crawler/crawler_github.py
+    command: supervisord -n -c /etc/supervisord.conf
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
+    restart: always
+    depends_on:
+      - surface-task-dispatcher
+    network_mode: host
