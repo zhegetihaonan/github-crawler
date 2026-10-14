@@ -1,25 +1,33 @@
 import base64
+import hashlib
 import json
 import random
 import re
 import threading
 import time
-import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import boto3
 import pika
 import requests
 import yaml
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from common.config import *
 from common.logger import setup_logger
+from common.rabbitmq import publish_dead_letter
 from common.redis_client import redis_client
+from common.task_tracking import (
+    finish_item,
+    is_item_cancelled,
+    mark_item_progress,
+    mark_item_retry,
+    mark_item_started,
+)
 
 
 logger = setup_logger("crawler_github_optimized")
@@ -29,6 +37,12 @@ HTTP_RETRY_STATUS = {403, 408, 429, 500, 502, 503, 504}
 STOPPED_TASK_SET = "crawler:task:stopped"
 DEFAULT_PER_PAGE = 50
 GITHUB_TOKEN_POOL = [token.strip() for token in GITHUB_TOKENS if token and token.strip()]
+
+
+class RequestFailure(RuntimeError):
+    def __init__(self, message: str, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
 
 s3 = None
 if MINIO_ENDPOINT and MINIO_ACCESS_KEY and MINIO_SECRET_KEY:
@@ -74,15 +88,19 @@ class Crawler(threading.Thread):
 
         self.ch_consume = self.connection.channel()
         self.ch_publish = self.connection.channel()
+        self.ch_publish.confirm_delivery()
 
         self.ch_consume.exchange_declare(exchange=TASK_EXCHANGE, exchange_type="topic", durable=True)
         self.ch_consume.queue_declare(queue=QUEUE_GITHUB, durable=True, arguments={"x-max-priority": 10})
         self.ch_consume.queue_bind(exchange=TASK_EXCHANGE, queue=QUEUE_GITHUB, routing_key=QUEUE_GITHUB)
+        self.ch_consume.queue_declare(queue=f"{QUEUE_GITHUB}.dead", durable=True)
         self.ch_consume.basic_qos(prefetch_count=1)
 
         self.ch_publish.exchange_declare(exchange=RESULT_EXCHANGE, exchange_type="topic", durable=True)
         self.ch_publish.queue_declare(queue=QUEUE_RESULT, durable=True, arguments={"x-max-priority": 10})
         self.ch_publish.queue_bind(exchange=RESULT_EXCHANGE, queue=QUEUE_RESULT, routing_key=QUEUE_RESULT)
+        self.ch_publish.queue_declare(queue=f"{QUEUE_GITHUB}.dead", durable=True)
+        self.ch_publish.queue_declare(queue=f"{QUEUE_RESULT}.dead", durable=True)
 
     def disconnect_from_rabbitmq(self):
         try:
@@ -96,6 +114,14 @@ class Crawler(threading.Thread):
             return
         for record in records:
             record.setdefault("crawler_id", str(self.cid))
+            identity = {
+                key: record.get(key)
+                for key in ("run_id", "task_id", "source", "keyword", "name", "matched_field", "file_path", "repo_url")
+            }
+            record.setdefault(
+                "result_id",
+                hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+            )
             self.ch_publish.basic_publish(
                 exchange=RESULT_EXCHANGE,
                 routing_key=QUEUE_RESULT,
@@ -192,10 +218,18 @@ class Crawler(threading.Thread):
                         proxies=proxy,
                     )
                     if resp.status_code in acceptable_status:
-                        logger.info("crawler=%s proxy=%s resp=%s", self.cid, proxy, resp.text[:300])
+                        proxy_url = (proxy or {}).get("https") or (proxy or {}).get("http")
+                        if proxy_url:
+                            parsed_proxy = urlsplit(proxy_url)
+                            proxy_label = f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
+                        else:
+                            proxy_label = "direct"
+                        logger.debug("crawler=%s request succeeded proxy=%s status=%s", self.cid, proxy_label, resp.status_code)
                         return resp
                     if resp.status_code == 404:
-                        logger.warning(f'url {url} --> 404')
+                        if "/search/" in url:
+                            raise RequestFailure("GitHub search endpoint returned 404", retryable=False)
+                        logger.debug("GitHub resource not found host=%s", urlsplit(url).hostname)
                         return None
                     if resp.status_code == 401:
                         self.log_request_failure(resp, url, attempt)
@@ -203,25 +237,29 @@ class Crawler(threading.Thread):
                         if refreshed_headers:
                             headers = refreshed_headers
                             continue
-                        return None
+                        raise RequestFailure("GitHub rejected the configured credentials", retryable=False)
                     self.log_request_failure(resp, url, attempt)
                     if resp.status_code not in HTTP_RETRY_STATUS:
-                        return None
+                        raise RequestFailure(
+                            f"HTTP {resp.status_code} from {urlsplit(url).hostname}", retryable=False
+                        )
                 except requests.RequestException as exc:
-                    logger.warning("crawler=%s request exception url=%s attempt=%s error=%s", self.cid, url, attempt, exc)
+                    logger.warning(
+                        "crawler=%s request error host=%s attempt=%s type=%s",
+                        self.cid, urlsplit(url).hostname, attempt, type(exc).__name__
+                    )
             time.sleep(min(3 * attempt, 15))
-        logger.warning("crawler=%s request failed after retries url=%s", self.cid, url)
-        return None
+        logger.warning("crawler=%s request exhausted retries host=%s", self.cid, urlsplit(url).hostname)
+        raise RequestFailure(f"Request to {urlsplit(url).hostname} failed after retries", retryable=True)
 
     def log_request_failure(self, resp: requests.Response, url: str, attempt: int):
         wait_seconds = self.github_retry_wait(resp)
         logger.warning(
-            "crawler=%s got status=%s url=%s attempt=%s body=%s",
+            "crawler=%s got status=%s host=%s attempt=%s",
             self.cid,
             resp.status_code,
-            url,
+            urlsplit(url).hostname,
             attempt,
-            resp.text[:500],
         )
         if wait_seconds:
             logger.warning("crawler=%s GitHub rate limited; sleep=%ss", self.cid, wait_seconds)
@@ -247,9 +285,19 @@ class Crawler(threading.Thread):
             return
         try:
             s3.head_bucket(Bucket=bucket_name)
-        except ClientError:
-            s3.create_bucket(Bucket=bucket_name)
-            logger.info("created MinIO bucket: %s", bucket_name)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code not in {"404", "NoSuchBucket", "NotFound"}:
+                logger.exception("cannot check MinIO bucket=%s", bucket_name)
+                return
+            try:
+                s3.create_bucket(Bucket=bucket_name)
+                logger.info("created MinIO bucket: %s", bucket_name)
+            except BotoCoreError:
+                logger.exception("cannot create MinIO bucket=%s", bucket_name)
+        except BotoCoreError:
+            # Storage downtime should not prevent the crawler from starting.
+            logger.exception("cannot reach MinIO bucket=%s; continuing without bucket check", bucket_name)
 
     @staticmethod
     def upload_to_minio(bucket_name: Optional[str], object_name: str, content: bytes) -> str:
@@ -259,7 +307,7 @@ class Crawler(threading.Thread):
             try:
                 s3.put_object(Bucket=bucket_name, Key=object_name, Body=content)
                 return f"{MINIO_ENDPOINT.rstrip('/')}/{bucket_name}/{object_name}"
-            except ClientError as exc:
+            except BotoCoreError as exc:
                 logger.warning("MinIO upload failed attempt=%s object=%s error=%s", attempt, object_name, exc)
                 time.sleep(2)
         return ""
@@ -401,6 +449,12 @@ class Crawler(threading.Thread):
     def is_task_stopped(self, task_id: str) -> bool:
         return bool(redis_client.sismember(STOPPED_TASK_SET, task_id))
 
+    def is_task_run_cancelled(self, task: Dict) -> bool:
+        if self.is_task_stopped(task["task_id"]):
+            return True
+        item_id = task.get("item_id")
+        return bool(item_id and is_item_cancelled(item_id))
+
     def repo_record(self, task_id: str, keyword: str, repo: Dict, author: Any, email: Any, last: Any) -> Dict:
         return {
             "task_id": task_id,
@@ -408,7 +462,7 @@ class Crawler(threading.Thread):
             "source": "github",
             "keyword": keyword,
             "name": repo["full_name"],
-            "description": repo["description"][:1000],
+            "description": (repo.get("description") or "")[:1000],
             "repo_url": repo["html_url"],
             "matched_field": "name_or_description",
             "file_path": "",
@@ -426,28 +480,56 @@ class Crawler(threading.Thread):
         keyword = task["keyword"]
         task_id = task["task_id"]
         max_page = int(task.get("max_page", 1))
-        if self.is_task_stopped(task_id):
+        if self.is_task_run_cancelled(task):
             logger.info("crawler=%s task stopped before scan task_id=%s", self.cid, task_id)
             return
 
-        repos = self.github_search_repos_by_keyword(keyword, SINCE_DATE, max_page)
-        logger.info("crawler=%s repo search keyword=%s found=%s", self.cid, keyword, len(repos))
-        for repo in repos:
-            if self.is_task_stopped(task_id):
+        if task.get("item_id"):
+            mark_item_progress(task["item_id"], 2, "searching_repositories")
+        repos = self.github_search_repos_by_keyword(keyword, get_since_date(), max_page)
+        logger.info("crawler=%s repository search complete task_id=%s found=%s", self.cid, task_id, len(repos))
+        seen_repos = set()
+        for index, repo in enumerate(repos):
+            if self.is_task_run_cancelled(task):
                 return
+            if repo["full_name"] in seen_repos:
+                continue
+            seen_repos.add(repo["full_name"])
             author, email, last = self.github_get_latest_commit_author(repo["full_name"])
             records = [self.repo_record(task_id, keyword, repo, author, email, last)]
             records.extend(self.readme_image_records(task_id, keyword, repo, author, email, last))
+            self._add_run_context(records, task)
             self.publish_result(records)
+            if task.get("item_id"):
+                progress = 5 + int(45 * (index + 1) / max(1, len(repos)))
+                mark_item_progress(task["item_id"], progress, "processing_repositories")
 
+        if task.get("item_id"):
+            mark_item_progress(task["item_id"], 55, "searching_code")
         code_matches = self.github_search_code_by_keyword(keyword, max_page)
-        logger.info("crawler=%s code search keyword=%s found=%s", self.cid, keyword, len(code_matches))
-        for match in code_matches:
-            if self.is_task_stopped(task_id):
+        logger.info("crawler=%s code search complete task_id=%s found=%s", self.cid, task_id, len(code_matches))
+        seen_files = set()
+        for index, match in enumerate(code_matches):
+            if self.is_task_run_cancelled(task):
                 return
+            file_identity = (match["repo_full_name"], match["file_path"])
+            if file_identity in seen_files:
+                continue
+            seen_files.add(file_identity)
             record = self.code_match_record(task_id, keyword, match)
             if record:
+                self._add_run_context([record], task)
                 self.publish_result([record])
+            if task.get("item_id"):
+                progress = 55 + int(44 * (index + 1) / max(1, len(code_matches)))
+                mark_item_progress(task["item_id"], progress, "processing_code_matches")
+
+    @staticmethod
+    def _add_run_context(records: List[Dict], task: Dict) -> None:
+        for record in records:
+            for key in ("run_id", "item_id"):
+                if task.get(key):
+                    record[key] = task[key]
 
     def readme_image_records(self, task_id: str, keyword: str, repo: Dict, author: Any, email: Any, last: Any) -> List[Dict]:
         readme_content = self.github_get_file_content(repo["full_name"], "README.md")
@@ -470,7 +552,7 @@ class Crawler(threading.Thread):
                     "source": "github",
                     "keyword": keyword,
                     "name": repo["full_name"],
-                    "description": repo["description"][:1000],
+                    "description": (repo.get("description") or "")[:1000],
                     "repo_url": repo["html_url"],
                     "matched_field": "readme_image",
                     "file_path": url,
@@ -513,6 +595,53 @@ class Crawler(threading.Thread):
             "last_commit_time": last,
         }
 
+    def retry_or_dead_letter(self, method, properties, body: bytes, task: Dict, exc: Exception) -> None:
+        headers = dict(getattr(properties, "headers", None) or {})
+        retry_count = int(headers.get("x-retry-count", 0))
+        item_id = task.get("item_id")
+        retryable = not isinstance(exc, RequestFailure) or exc.retryable
+
+        if retryable and retry_count + 1 < MAX_TASK_ATTEMPTS:
+            next_count = retry_count + 1
+            if item_id:
+                mark_item_retry(item_id, str(exc))
+            time.sleep(min(2 ** next_count, 30))
+            headers["x-retry-count"] = next_count
+            self.ch_publish.basic_publish(
+                exchange=TASK_EXCHANGE,
+                routing_key=QUEUE_GITHUB,
+                body=body,
+                properties=pika.BasicProperties(
+                    content_type="application/json",
+                    delivery_mode=2,
+                    priority=int(task.get("priority", 0)),
+                    headers=headers,
+                    correlation_id=getattr(properties, "correlation_id", None),
+                ),
+                mandatory=True,
+            )
+            self.ch_consume.basic_ack(method.delivery_tag)
+            logger.warning(
+                "crawler=%s requeued task_id=%s retry=%s/%s",
+                self.cid, task.get("task_id"), next_count + 1, MAX_TASK_ATTEMPTS
+            )
+            return
+
+        if item_id:
+            finish_item(item_id, "failed", str(exc))
+        publish_dead_letter(
+            self.ch_publish,
+            QUEUE_GITHUB,
+            body,
+            str(exc),
+            headers=headers,
+        )
+        self.ch_consume.basic_ack(method.delivery_tag)
+        logger.error(
+            "crawler=%s dead-lettered task_id=%s retries=%s error_type=%s",
+            self.cid, task.get("task_id"), retry_count, type(exc).__name__
+        )
+
     def run(self):
         time.sleep(random.randint(1, 3))
         try:
@@ -526,12 +655,41 @@ class Crawler(threading.Thread):
                 task = {}
                 try:
                     task = json.loads(body)
-                    logger.info("crawler=%s processing task=%s", self.cid, task)
+                    if not isinstance(task, dict) or not task.get("task_id") or not task.get("keyword"):
+                        raise ValueError("task must be an object with task_id and keyword")
+                    if self.is_task_stopped(task["task_id"]):
+                        if task.get("item_id"):
+                            finish_item(task["item_id"], "cancelled")
+                        self.ch_consume.basic_ack(method.delivery_tag)
+                        continue
+                    if task.get("item_id") and not mark_item_started(
+                        task["item_id"], redelivered=bool(getattr(method, "redelivered", False))
+                    ):
+                        logger.info("crawler=%s skipped duplicate item_id=%s", self.cid, task["item_id"])
+                        self.ch_consume.basic_ack(method.delivery_tag)
+                        continue
+                    logger.info("crawler=%s processing task_id=%s", self.cid, task["task_id"])
                     self.github_scan(task)
-                    logger.info("crawler=%s task done task=%s", self.cid, task)
-                except Exception:
-                    logger.exception("crawler=%s task failed task=%s error=%s", self.cid, task, traceback.format_exc())
-                finally:
+                    if self.is_task_run_cancelled(task):
+                        if task.get("item_id"):
+                            finish_item(task["item_id"], "cancelled")
+                        self.ch_consume.basic_ack(method.delivery_tag)
+                        continue
+                    if task.get("item_id"):
+                        finish_item(task["item_id"], "succeeded")
+                    logger.info("crawler=%s task complete task_id=%s", self.cid, task["task_id"])
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                    logger.exception("crawler=%s received an invalid task message", self.cid)
+                    if isinstance(task, dict) and task.get("item_id"):
+                        finish_item(task["item_id"], "failed", str(exc))
+                    publish_dead_letter(self.ch_publish, QUEUE_GITHUB, body, str(exc))
+                    self.ch_consume.basic_ack(method.delivery_tag)
+                    continue
+                except Exception as exc:
+                    logger.exception("crawler=%s task failed task_id=%s", self.cid, task.get("task_id"))
+                    self.retry_or_dead_letter(method, properties, body, task, exc)
+                    continue
+                else:
                     self.ch_consume.basic_ack(method.delivery_tag)
         except Exception:
             logger.exception("crawler=%s crashed", self.cid)

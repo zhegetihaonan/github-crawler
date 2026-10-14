@@ -25,6 +25,7 @@ def _connect():
     conn = pika.BlockingConnection(parameters)
     ch = conn.channel()
     ch.basic_qos(prefetch_count=1)
+    ch.confirm_delivery()
 
     # 声明交换机和队列（幂等）
     ch.exchange_declare(exchange=TASK_EXCHANGE, exchange_type="topic", durable=True)
@@ -38,6 +39,8 @@ def _connect():
     ch.exchange_declare(exchange=RESULT_EXCHANGE, exchange_type="topic", durable=True)
     ch.queue_declare(queue=QUEUE_RESULT, durable=True, arguments={"x-max-priority": 10})
     ch.queue_bind(exchange=RESULT_EXCHANGE, queue=QUEUE_RESULT, routing_key=QUEUE_RESULT)
+    for queue in (QUEUE_GITHUB, QUEUE_WENKU, QUEUE_RESULT):
+        ch.queue_declare(queue=f"{queue}.dead", durable=True)
 
     return conn, ch
 
@@ -104,6 +107,7 @@ class Publisher:
                     )
                 )
                 self.ch = self.conn.channel()
+                self.ch.confirm_delivery()
                 self.ch.exchange_declare(exchange=RESULT_EXCHANGE, exchange_type="topic", durable=True)
                 return
             except Exception as e:
@@ -131,3 +135,19 @@ class Publisher:
                 self.conn.close()
         except:
             pass
+
+
+def publish_dead_letter(channel, queue, body, reason, headers=None):
+    dead_headers = dict(headers or {})
+    dead_headers.update({"x-original-queue": queue, "x-dead-letter-reason": str(reason)[:500]})
+    channel.basic_publish(
+        exchange="",
+        routing_key=f"{queue}.dead",
+        body=body,
+        properties=pika.BasicProperties(
+            content_type="application/json",
+            delivery_mode=2,
+            headers=dead_headers,
+        ),
+        mandatory=True,
+    )

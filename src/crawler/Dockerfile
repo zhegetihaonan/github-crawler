@@ -1,17 +1,22 @@
-FROM surface_web_base:v1.2
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /home/surface_crawler
 
-#COPY requirements.txt .
-#
-#RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-#
-## 👉 安装 playwright 浏览器 + 依赖
-#RUN playwright install --with-deps chromium
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends supervisor \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/surface_crawler/common /home/surface_crawler/logs
-COPY ./crawler /home/surface_crawler
-COPY ./common /home/surface_crawler/common
+# Copy dependencies first so crawler source edits can reuse this layer.
+COPY ./crawler/requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+COPY ./crawler/ /home/surface_crawler/
+COPY ./common/ /home/surface_crawler/common/
 COPY ./crawler/supervisord.conf /etc/supervisord.conf
+RUN mkdir -p /home/surface_crawler/logs
 
 CMD ["supervisord", "-n", "-c", "/etc/supervisord.conf"]

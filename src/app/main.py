@@ -1,23 +1,51 @@
-from fastapi import FastAPI, HTTPException, Query
-from common.rabbitmq import publish_task
+from datetime import datetime
+import hmac
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from common.redis_client import redis_client
 from schemas import TaskRequest
 from common.logger import setup_logger
-from common.config import *
-import pika
-from sqlalchemy import create_engine, text
-import json
+from common.config import (
+    API_KEY,
+    ENABLE_WENKU_CRAWLER,
+    PROXY_URL,
+    QUEUE_GITHUB,
+    QUEUE_WENKU,
+    TASK_EXCHANGE,
+)
+from common.rabbitmq import publish_task
+from common.task_tracking import (
+    IdempotencyConflict,
+    cancel_task as cancel_tracked_task,
+    create_task_run,
+    dispatch_outbox,
+    ensure_tracking_schema,
+    get_run_status,
+    get_task_status,
+)
+from sqlalchemy import text
 import threading
-from proxy.manager import get_proxy, fail
-from proxy.fetcher import run as fetcher_run
-from proxy.checker import run as checker_run
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from scheduler_db import engine, save_cycle_task, get_active_cycle_tasks
 
+try:
+    from proxy.manager import get_proxy, fail
+    from proxy.fetcher import run as fetcher_run
+    from proxy.checker import run as checker_run
+except ModuleNotFoundError:
+    get_proxy = fail = fetcher_run = checker_run = None
+
 logger = setup_logger(__name__)
 
-app = FastAPI(title="Surface Web Task Dispatcher")
+
+def require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    if API_KEY and (not x_api_key or not hmac.compare_digest(x_api_key, API_KEY)):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+app = FastAPI(title="Surface Web Task Dispatcher", dependencies=[Depends(require_api_key)])
 scheduler = BackgroundScheduler(
     job_defaults={
         "max_instances": 3,
@@ -27,7 +55,7 @@ scheduler = BackgroundScheduler(
 )
 
 
-# 用来记录已经注册的周期任务id
+# 用来记录已经注册的周期任务 id
 registered_tasks = set()
 
 
@@ -38,7 +66,7 @@ def load_tasks_from_db():
     for task in tasks:
         if task["task_id"] not in registered_tasks:
             scheduler.add_job(
-                dispatch_task,
+                schedule_task_run,
                 trigger=IntervalTrigger(seconds=task["request_interval"]),
                 args=[task],
                 id=task["task_id"],
@@ -54,88 +82,109 @@ def load_tasks_from_db():
 
 
 def dispatch_task(task: dict):
-    task_id = task["task_id"]
-    if redis_client.sismember("crawler:task:stopped", task_id):
-        logger.info(f"任务已停止下发: {task_id}")
-        return
-    for keyword in task["keywords"]:
-        dedup_key = f"task:dedup:{task_id}"
+    """Create a durable run; the outbox publisher delivers its child tasks."""
+    if redis_client.sismember("crawler:task:stopped", task["task_id"]):
+        logger.info("Skipped scheduled run for stopped task task_id=%s", task["task_id"])
+        return None
+    return create_task_run(task, task_sources(), TASK_EXCHANGE)
 
-        if redis_client.sismember(dedup_key, keyword):
-            continue
 
-        redis_client.sadd(dedup_key, keyword)
-        redis_client.expire(dedup_key, DEDUP_TIMEOUT)
+def task_sources():
+    sources = [("github", QUEUE_GITHUB)]
+    if ENABLE_WENKU_CRAWLER:
+        sources.append(("wenku", QUEUE_WENKU))
+    return sources
 
-        sub_task = {
-            "task_id": task_id,
-            "task_type": task["task_type"],
-            "keyword": keyword,
-            "priority": task["priority"],
-            "max_page": task["max_page"],
-            "request_interval": task["request_interval"],
-        }
 
-        for queue in [QUEUE_GITHUB, QUEUE_WENKU]:
-            publish_task(TASK_EXCHANGE, queue, sub_task, priority=task["priority"])
+def publish_pending_tasks():
+    try:
+        def publish_with_priority(exchange, routing_key, payload):
+            publish_task(exchange, routing_key, payload, priority=int(payload.get("priority", 0)))
 
-            logger.info(f"下发子任务: {sub_task} ------> {queue}")
+        count = dispatch_outbox(publish_with_priority)
+        if count:
+            logger.info("Published %s task messages from outbox", count)
+    except Exception:
+        logger.exception("Outbox dispatch cycle failed")
+
+
+def schedule_task_run(task: dict):
+    run = dispatch_task(task)
+    if run:
+        logger.info("Created scheduled task run task_id=%s run_id=%s", task["task_id"], run["run_id"])
+    return run
 
 
 @app.on_event("startup")
 def startup_event():
+    if not API_KEY:
+        logger.warning("API_KEY is not configured; task API endpoints are unauthenticated")
+    ensure_tracking_schema()
     scheduler.start()
     scheduler.add_job(
         lambda: logger.info("scheduler alive"),
         "interval",
         seconds=300
     )
+    scheduler.add_job(publish_pending_tasks, "interval", seconds=1, id="task-outbox-publisher", max_instances=1)
     logger.info("启动 scheduler")
     load_tasks_from_db()
     logger.info("Scheduler 启动完成")
     # 订阅更新线程
-    threading.Thread(target=fetcher_run, daemon=True).start()
-
-    # 健康检测线程
-    threading.Thread(target=checker_run, daemon=True).start()
+    if fetcher_run and checker_run:
+        threading.Thread(target=fetcher_run, daemon=True, name="proxy-fetcher").start()
+        threading.Thread(target=checker_run, daemon=True, name="proxy-checker").start()
 
 
 @app.post("/crawler/task")
-def dispatch(task: TaskRequest):
+def dispatch(task: TaskRequest, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key", max_length=255)):
     try:
         if task.task_type == 0:
             save_cycle_task(task)
-            dispatch_task(task.dict())
-            logger.info(f"新增单次任务: {task.task_id}")
-            return {"code": 201, "message": f"单次任务 {task.task_id} 创建成功"}
+            redis_client.srem("crawler:task:stopped", task.task_id)
+            existing_job = scheduler.get_job(task.task_id)
+            if existing_job:
+                scheduler.remove_job(task.task_id)
+                registered_tasks.discard(task.task_id)
+            run = create_task_run(task.model_dump(), task_sources(), TASK_EXCHANGE, idempotency_key)
+            logger.info("Accepted one-time task task_id=%s run_id=%s", task.task_id, run["run_id"])
+            return {"code": 202, "message": "任务已接受", "run_id": run["run_id"], "status": run["status"]}
 
         elif task.task_type == 1:
-            # 周期任务
             save_cycle_task(task)
-            # 注册到 scheduler
-            if task.task_id not in registered_tasks:
-                # 立即执行一次
-                dispatch_task(task.dict())
-                scheduler.add_job(
-                    dispatch_task,
-                    trigger=IntervalTrigger(seconds=task.request_interval),
-                    args=[task.dict()],
-                    id=task.task_id,
-                    # next_run_time=datetime.now(),
-                    replace_existing=True
-                )
-                registered_tasks.add(task.task_id)
-                logger.info(f"新增周期任务: {task.task_id}")
-                return {"code": 201, "message": f"周期任务 {task.task_id} 创建成功"}
-
-        logger.info(f'任务下发成功: {task}')
-        return {
-            "code": 201,
-            "message": "任务创建成功"
-        }
+            redis_client.srem("crawler:task:stopped", task.task_id)
+            run = schedule_task_run(task.model_dump())
+            scheduler.add_job(
+                schedule_task_run,
+                trigger=IntervalTrigger(seconds=task.request_interval),
+                args=[task.model_dump()],
+                id=task.task_id,
+                replace_existing=True,
+            )
+            registered_tasks.add(task.task_id)
+            logger.info("Registered periodic task task_id=%s run_id=%s", task.task_id, run["run_id"])
+            return {"code": 202, "message": "周期任务已接受", "run_id": run["run_id"], "status": run["status"]}
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except Exception as e:
-        logger.error(f"任务下发失败: {e}")
+        logger.exception("Task submission failed task_id=%s error_type=%s", task.task_id, type(e).__name__)
         raise HTTPException(status_code=500, detail="任务下发失败")
+
+
+@app.get("/crawler/task/{task_id}")
+def task_status(task_id: str):
+    result = get_task_status(task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return result
+
+
+@app.get("/crawler/task/{task_id}/runs/{run_id}")
+def task_run_status(task_id: str, run_id: str):
+    result = get_run_status(run_id)
+    if not result or result["task_id"] != task_id:
+        raise HTTPException(status_code=404, detail="任务运行记录不存在")
+    return result
 
 
 @app.delete("/crawler/task")
@@ -150,6 +199,7 @@ def delete_task(task_id: str = Query(...)):
         sql = "UPDATE tasks SET status=0 WHERE task_id=:task_id"
         with engine.begin() as conn:
             conn.execute(text(sql), {"task_id": task_id})
+        cancel_tracked_task(task_id)
         logger.info(f"任务已在数据库标记停止: {task_id}")
 
         # 如果是周期任务需要从 scheduler 移除
@@ -171,21 +221,18 @@ def delete_task(task_id: str = Query(...)):
 # mock 上报接口（为了链路先跑通）
 @app.post("/mock/report")
 def mock_report(data: dict):
-    logger.info(f"收到结果上报: {data}")
+    logger.info("Mock result received source=%s task_id=%s", data.get("source"), data.get("task_id"))
     return {"code": 200, "message": "ok"}
 
 
 @app.get("/proxy")
 def proxy():
-
-    p = get_proxy()
-
-    return {"proxy": p}
+    return {"proxy": get_proxy() if get_proxy else PROXY_URL}
 
 
 @app.post("/proxy/fail")
 def proxy_fail(proxy: str):
-
+    if not fail:
+        raise HTTPException(status_code=503, detail="Proxy manager is not installed")
     fail(proxy)
-
     return {"ok": True}
