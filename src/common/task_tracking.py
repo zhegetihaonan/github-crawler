@@ -175,6 +175,7 @@ def create_task_run(
                 "run_id": item["run_id"],
                 "item_id": item["item_id"],
                 "source": item["source"],
+                "keyword": item["keyword"]
             }
             connection.execute(
                 text("""
