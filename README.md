@@ -74,6 +74,16 @@ curl -X DELETE 'http://localhost:8008/crawler/task?task_id=leak-monitor-20261013
 
 `RESULTS_DB_ENABLED=0` 时可以关闭数据库保存；此时至少配置对应来源的 report URL。查看接口文档：`http://localhost:8008/docs`。
 
+## Tests
+
+运行单元测试：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+当前可靠性测试覆盖重复任务消息，以及消息发布成功但 outbox 状态更新失败后的重试恢复。测试使用 mock，不连接真实 MySQL 或 RabbitMQ。
+
 ## 配置与发布
 
 `.env.example` 是模板，真实 token 和密码只放在本地 `.env`，不要提交。`.gitignore` 已忽略 `.env`。
